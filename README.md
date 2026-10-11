@@ -1,72 +1,105 @@
-# workbuddy-skills
+# agent-skills
 
-WorkBuddy 本地技能合集，附带一个管理这些技能的命令行工具。
+A few agent skills, plus a CLI that manages them across agents.
 
-A collection of local skills for WorkBuddy, plus a small CLI that manages them.
+Nothing here is tied to one product. Every skill is a directory with a `SKILL.md`
+in it, and every agent that discovers skills from a `<agent-home>/skills/`
+folder can use the same files.
 
-## 内容 / Contents
+## Contents
 
-| 路径 | 说明 |
+| Path | What it is |
 | --- | --- |
-| `skills/md-to-deliverable-docx/` | 把会话里写好的 Markdown 转成可交付的 Word 文档。通用层，不含任何个人偏好，可直接复用 |
-| `tools/skillcli.py` | 管理 `~/.workbuddy/skills` 的命令行工具：`list` / `validate` / `install` / `uninstall` / `info` / `pack` |
+| `skills/md-to-deliverable-docx/` | Turn Markdown written in a chat into a deliverable Word file with pandoc. Generic, no personal preferences baked in |
+| `tools/skillcli.py` | CLI for `list`, `validate`, `install`, `uninstall`, `info` and `pack` |
 
-## 为什么需要 skillcli
+## Where skills live
 
-官方的 [`@tomaskral/skillmanager`](https://github.com/kadel/skillmanager) 只能把技能装进 `claude`、`openclaw`、`codex`、`gemini` 这几个 agent 的目录，`--agent` 里没有 `workbuddy`，因此管不了 `~/.workbuddy/skills`。skillcli 补上这一环，并额外提供 frontmatter 校验与打包。
+| Agent | Global | Project |
+| --- | --- | --- |
+| WorkBuddy | `~/.workbuddy/skills` | `.workbuddy/skills` |
+| Claude Code | `~/.claude/skills` | `.claude/skills` |
+| Codex | `~/.codex/skills` | `.agents/skills` |
+| OpenClaw | `~/.openclaw/skills` | `.agents/skills` |
+| Gemini CLI | `~/.gemini/skills` | `.agents/skills` |
 
-只用 Python 标准库，无需安装依赖。
+## Install a skill
 
-## 安装技能
-
-直接放进技能目录：
+Copy it into whichever directory above matches your agent:
 
 ```bash
-git clone https://github.com/<owner>/workbuddy-skills.git
-cp -r workbuddy-skills/skills/md-to-deliverable-docx ~/.workbuddy/skills/
+git clone https://github.com/Gray-bottom/agent-skills.git
+cp -r agent-skills/skills/md-to-deliverable-docx ~/.claude/skills/
 ```
 
-或者用官方 CLI 装到别的 agent：
+Or with the official CLI, which installs from a GitHub URL:
 
 ```bash
 npx @tomaskral/skillmanager@latest install \
-  https://github.com/<owner>/workbuddy-skills/tree/main/skills/md-to-deliverable-docx \
+  https://github.com/Gray-bottom/agent-skills/tree/main/skills/md-to-deliverable-docx \
   --agent claude
 ```
 
-## 使用 skillcli
+## skillcli
 
-需要 Python 3.9 以上。技能目录默认 `~/.workbuddy/skills`，可用 `--skills-dir` 或环境变量 `WORKBUDDY_SKILLS_DIR` 覆盖。
+Python 3.9 or newer, standard library only, no dependencies.
 
 ```bash
-python tools/skillcli.py list                    # 列出已装技能
-python tools/skillcli.py list --json             # 机器可读
-python tools/skillcli.py validate                # 校验全部技能的 frontmatter 与结构
-python tools/skillcli.py validate some-skill     # 只校验一个
-python tools/skillcli.py info some-skill         # 详情、文件清单、来源与 commit
-python tools/skillcli.py install ./some-skill --dry-run
-python tools/skillcli.py install https://github.com/owner/repo/tree/main/skills/foo
-python tools/skillcli.py uninstall some-skill    # 移入 .trash，不直接删除
+python tools/skillcli.py list                    # every known agent whose skills dir exists
+python tools/skillcli.py list --json
+python tools/skillcli.py validate                # all skills in scope
+python tools/skillcli.py validate md-to-deliverable-docx
+python tools/skillcli.py info md-to-deliverable-docx
+python tools/skillcli.py install ./some-skill --agent claude --dry-run
+python tools/skillcli.py install https://github.com/owner/repo/tree/main/skills/foo --agent workbuddy
+python tools/skillcli.py uninstall some-skill --agent codex
 python tools/skillcli.py pack md-to-deliverable-docx -o dist
 ```
 
-安装私有仓库时设置 `GITHUB_TOKEN` 环境变量。`uninstall` 把技能移到 `<skills-dir>/.trash/` 并打上时间戳，而不是删掉。
+`install` requires an explicit target, either `--agent` or `--skills-dir`. Everything
+else falls back to every agent directory that already exists, and refuses to act when
+a skill name appears in more than one of them.
 
-## md-to-deliverable-docx 解决什么
+Set `GITHUB_TOKEN` to install from private repositories.
 
-把 Markdown 正文用 pandoc 转成 `.docx`，核心是三条判断：
+`uninstall` moves the skill to `<skills-dir>/.trash/<name>-<timestamp>` instead of
+deleting it, so an accidental removal is recoverable.
 
-1. 参考模板由使用者提供，转换前必须拿到路径；没有就停下来等，不用默认样式硬出。
-2. 默认走**直连** `pandoc in.md -o out.docx --reference-doc <模板>`。两段式 `md→html→docx` 会把 LaTeX 公式拍成纯文本或以原始 TeX 留在正文里，含公式的文档一律不能走。
-3. 直连会静默丢掉原始 HTML 的 `<sub>` `<sup>` `<u>`，改用原生 `~x~` / `^x^` 语法。
+`pack` refuses to build a zip when validation fails; pass `--force` to override.
 
-完整规则见 `skills/md-to-deliverable-docx/SKILL.md`。
+### Why not only use skillmanager
 
-## 不含的内容
+The official [`@tomaskral/skillmanager`](https://github.com/kadel/skillmanager) is
+good at install and update, but its `--agent` list stops at `claude`, `openclaw`,
+`codex` and `gemini`, and it has no validation or packaging. `skillcli` covers the
+same agents plus WorkBuddy, and adds `validate`, `info` and `pack`. They can sit side
+by side without interfering.
 
-- 参考模板不随本仓库分发，需使用者自备。本机自用的那套来自 [Achuan-2/pandoc_docx_template](https://github.com/Achuan-2/pandoc_docx_template)。
-- 该仓库的 `markdown-to-docx.lua` 过滤器同样未包含。需要它支持的 `==高亮==`、HTML 颜色 span、HTML `<img>` 时请自行获取。
+## What md-to-deliverable-docx is for
 
-## 许可
+Converting Markdown into a `.docx` with pandoc, and getting the awkward cases right.
+Three rules carry most of the value:
 
-尚未指定。若希望他人自由复用，请补充一个 LICENSE 文件。
+1. The reference template comes from the user. Ask for its path before converting.
+   If it is not given, stop rather than falling back to default styles.
+2. Convert directly, `pandoc in.md -o out.docx --reference-doc <template>`.
+   Routing through HTML (`md -> html -> docx`) silently destroys LaTeX math: inline
+   formulas collapse to plain text and display formulas stay in the document as raw
+   TeX. Any document containing math must avoid that route.
+3. Direct conversion drops raw HTML `<sub>`, `<sup>` and `<u>`. Use the native
+   `~x~` and `^x^` syntax instead.
+
+Full rules, including the CJK path workaround and the known failure modes, are in
+`skills/md-to-deliverable-docx/SKILL.md`.
+
+## Not included
+
+- Reference templates are not bundled. Bring your own `.docx`.
+- The `markdown-to-docx.lua` filter from
+  [Achuan-2/pandoc_docx_template](https://github.com/Achuan-2/pandoc_docx_template)
+  is not bundled either. Without it, `==highlight==`, HTML colour spans and HTML
+  `<img>` tags are ignored, so use native Markdown syntax for those.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

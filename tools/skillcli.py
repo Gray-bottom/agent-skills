@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""skillcli - manage WorkBuddy local skills.
+"""skillcli - list, validate, install, pack and remove agent skills.
 
-Commands: list / validate / install / uninstall / info / pack
+Agent-agnostic. A "skill" is a directory containing SKILL.md with YAML
+frontmatter (name, description, and optionally agent_created).
 
-The official skillmanager CLI recognizes only claude, openclaw, codex and gemini
-as target agents, so it cannot touch ~/.workbuddy/skills. This tool covers that
-gap and adds packaging. Skills live in WORKBUDDY_SKILLS_DIR, default
-~/.workbuddy/skills.
+Target resolution, in order:
+  1. --skills-dir PATH
+  2. --agent NAME [--scope global|project]
+  3. environment SKILLS_DIR, or SKILLS_AGENT with SKILLS_SCOPE
+  4. every known agent whose skills directory already exists
+     (commands that act on one skill need the name to be unambiguous)
+  5. otherwise, error out and ask for an explicit target
+
+Read-only on anything outside the target skills directory. `uninstall` moves a
+skill into <skills-dir>/.trash with a timestamp instead of deleting it.
 """
 
 from __future__ import annotations
@@ -20,19 +27,23 @@ import sys
 import tarfile
 import tempfile
 import time
-import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
 
-SKILLS_DIR = Path(
-    os.environ.get("WORKBUDDY_SKILLS_DIR", Path.home() / ".workbuddy" / "skills")
-).expanduser()
+# Global and project skills directories per agent. Mirrors the layout used by
+# the official skillmanager CLI so the two tools stay compatible.
+AGENTS: dict[str, dict[str, str]] = {
+    "workbuddy": {"global": "~/.workbuddy/skills", "project": ".workbuddy/skills"},
+    "claude": {"global": "~/.claude/skills", "project": ".claude/skills"},
+    "codex": {"global": "~/.codex/skills", "project": ".agents/skills"},
+    "openclaw": {"global": "~/.openclaw/skills", "project": ".agents/skills"},
+    "gemini": {"global": "~/.gemini/skills", "project": ".agents/skills"},
+}
 
-TRASH_DIR = SKILLS_DIR / ".trash"
 GITHUB_URL = re.compile(
     r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)"
-    r"(?:\.git)?(?:/tree/(?P<branch>.+?))?(?:/(?P<sub>.+))?/?$"
+    r"(?:\.git)?(?:/tree/(?P<branch>.+?))?/(?P<sub>.+?)/?$"
 )
 
 OK = "  ok  "
@@ -44,50 +55,130 @@ def out(msg: str = "") -> None:
     sys.stdout.write(msg + "\n")
 
 
-def die(msg: str) -> "typing.NoReturn":  # noqa: F821
+def die(msg: str) -> None:
     sys.stderr.write("error: " + msg + "\n")
     raise SystemExit(1)
 
 
-def skill_dirs() -> list[Path]:
-    if not SKILLS_DIR.is_dir():
-        return []
-    return sorted(
-        d
-        for d in SKILLS_DIR.iterdir()
-        if d.is_dir() and not d.name.startswith(".") and (d / "SKILL.md").is_file()
+def agent_dir(agent: str, scope: str = "global") -> Path:
+    if agent not in AGENTS:
+        die("unknown agent %r, known: %s" % (agent, ", ".join(sorted(AGENTS))))
+    raw = AGENTS[agent][scope]
+    if raw.startswith("~/"):
+        return Path.home() / raw[2:]
+    return (Path.cwd() / raw).resolve()
+
+
+def roots(args: argparse.Namespace, for_install: bool = False) -> list[tuple[str, Path]]:
+    """Return [(label, directory)] to operate on."""
+    if getattr(args, "skills_dir", None):
+        return [("explicit", Path(args.skills_dir).expanduser().resolve())]
+
+    agent = getattr(args, "agent", None) or (
+        None if for_install else os.environ.get("SKILLS_AGENT")
     )
+    if agent:
+        scope = getattr(args, "scope", None) or os.environ.get("SKILLS_SCOPE") or "global"
+        return [("%s:%s" % (agent, scope), agent_dir(agent, scope))]
+
+    if not for_install:
+        env_dir = os.environ.get("SKILLS_DIR")
+        if env_dir:
+            return [("env", Path(env_dir).expanduser().resolve())]
+
+    if for_install:
+        die(
+            "install needs an explicit target. Pass --agent NAME (known: %s) "
+            "or --skills-dir PATH." % ", ".join(sorted(AGENTS))
+        )
+
+    found: list[tuple[str, Path]] = []
+    for name in AGENTS:
+        for scope in ("global", "project"):
+            d = agent_dir(name, scope)
+            if d.is_dir():
+                found.append(("%s:%s" % (name, scope), d))
+    if not found:
+        die(
+            "no skills directory found under any known agent. Pass --agent NAME "
+            "or --skills-dir PATH."
+        )
+    return found
 
 
-def resolve(name: str) -> Path:
-    """Find a skill by directory name or by the name in its frontmatter."""
-    target = SKILLS_DIR / name
-    if (target / "SKILL.md").is_file():
-        return target
-    for d in skill_dirs():
-        fm, _ = read_frontmatter(d / "SKILL.md")
-        if fm and fm.get("name") == name:
-            return d
-    die("no skill named %r under %s" % (name, SKILLS_DIR))
+def iter_skills(rs: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+    items: list[tuple[str, Path]] = []
+    for label, root in rs:
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            if d.is_dir() and not d.name.startswith("."):
+                items.append((label, d))
+    return items
+
+
+def valid_skills(rs: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+    return [(l, d) for l, d in iter_skills(rs) if (d / "SKILL.md").is_file()]
+
+
+def resolve(name: str, rs: list[tuple[str, Path]]) -> tuple[str, Path]:
+    """Find one skill by directory name or by frontmatter name."""
+    hits = [
+        (label, d)
+        for label, d in valid_skills(rs)
+        if d.name == name
+        or (read_frontmatter(d / "SKILL.md")[0] or {}).get("name") == name
+    ]
+    if not hits:
+        die("no skill named %r in: %s" % (name, ", ".join(str(r) for _, r in rs)))
+    if len(hits) > 1:
+        die(
+            "%r exists in several places, pin one with --agent or --skills-dir:\n  "
+            + "\n  ".join("%s -> %s" % (l, d) for l, d in hits)
+        )
+    return hits[0]
 
 
 def read_frontmatter(path: Path) -> tuple[dict | None, str]:
-    text = path.read_text(encoding="utf-8")
-    if not text.lstrip().startswith("---"):
+    """Parse the leading YAML block. Only the keys we care about are read, but
+    folded (>) and literal (|) block scalars are supported because descriptions
+    are often written that way."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
         return None, text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
         return None, text
+
     fm: dict[str, str] = {}
-    for line in parts[1].splitlines():
-        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", line)
-        if m:
-            fm[m.group(1)] = m.group(2).strip().strip('"').strip("'")
-    return fm, parts[2]
+    block = lines[1:end]
+    i = 0
+    while i < len(block):
+        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", block[i])
+        if not m:
+            i += 1
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if val in {">", ">-", ">+", "|", "|-", "|+", ""}:
+            collected: list[str] = []
+            i += 1
+            while i < len(block):
+                nxt = block[i]
+                if nxt.strip() == "" or re.match(r"^\s", nxt):
+                    collected.append(nxt.strip())
+                    i += 1
+                    continue
+                break
+            joiner = "\n" if val.startswith("|") else " "
+            fm[key] = joiner.join(x for x in collected if x)
+        else:
+            fm[key] = val.strip('"').strip("'")
+            i += 1
+    return fm, "\n".join(lines[end + 1 :])
 
 
 def check(skill: Path) -> list[tuple[str, str]]:
-    """Return a list of (status, message)."""
     results: list[tuple[str, str]] = []
     skill_md = skill / "SKILL.md"
     if not skill_md.is_file():
@@ -95,15 +186,12 @@ def check(skill: Path) -> list[tuple[str, str]]:
 
     fm, body = read_frontmatter(skill_md)
     if fm is None:
-        results.append((FAIL, "YAML frontmatter missing or unterminated"))
-        return results
+        return [(FAIL, "YAML frontmatter missing or unterminated")]
 
     if not fm.get("name"):
         results.append((FAIL, "frontmatter has no name"))
     elif fm["name"] != skill.name:
-        results.append(
-            (FAIL, "name %r does not match directory %r" % (fm["name"], skill.name))
-        )
+        results.append((FAIL, "name %r does not match directory %r" % (fm["name"], skill.name)))
     else:
         results.append((OK, "name matches directory"))
 
@@ -116,7 +204,7 @@ def check(skill: Path) -> list[tuple[str, str]]:
         results.append((OK, "description present (%d chars)" % len(desc)))
 
     if fm.get("agent_created") != "true":
-        results.append((WARN, "agent_created: true not set, model cannot edit it"))
+        results.append((WARN, "agent_created not true, the model cannot edit it later"))
     else:
         results.append((OK, "agent_created set"))
 
@@ -124,72 +212,75 @@ def check(skill: Path) -> list[tuple[str, str]]:
         results.append((WARN, "body is nearly empty"))
     else:
         results.append((OK, "body present (%d words)" % len(body.split())))
-
-    stray = [
-        p.name
-        for p in skill.iterdir()
-        if p.is_file() and p.suffix not in {".md", ".json", ".txt", ".lua", ".py", ".sh"}
-    ]
-    if stray:
-        results.append((WARN, "unexpected files: " + ", ".join(stray)))
     return results
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    skills = skill_dirs()
+    rs = roots(args)
     if args.json:
         payload = []
-        for d in skills:
-            fm, body = read_frontmatter(d / "SKILL.md")
+        for label, d in valid_skills(rs):
+            fm, _ = read_frontmatter(d / "SKILL.md")
+            files = [p for p in d.rglob("*") if p.is_file()]
             payload.append(
                 {
-                    "dir": d.name,
+                    "agent": label,
+                    "dir": str(d),
                     "name": (fm or {}).get("name"),
                     "description": (fm or {}).get("description"),
                     "agent_created": (fm or {}).get("agent_created"),
-                    "files": len([p for p in d.rglob("*") if p.is_file()]),
-                    "bytes": sum(p.stat().st_size for p in d.rglob("*") if p.is_file()),
-                    "missing_skill_md": False,
+                    "files": len(files),
+                    "bytes": sum(p.stat().st_size for p in files),
                 }
             )
         out(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
-    if not skills:
-        out("no skills under %s" % SKILLS_DIR)
-        return
-
-    broken = [
-        d.name
-        for d in SKILLS_DIR.iterdir()
-        if d.is_dir() and not d.name.startswith(".") and not (d / "SKILL.md").is_file()
-    ]
-    out("skills dir: %s" % SKILLS_DIR)
-    out("%-32s %8s %6s  %s" % ("NAME", "FILES", "SIZE", "DESCRIPTION"))
-    for d in skills:
-        fm, _ = read_frontmatter(d / "SKILL.md")
-        files = [p for p in d.rglob("*") if p.is_file()]
-        size = sum(p.stat().st_size for p in files)
-        desc = (fm or {}).get("description", "")
-        desc = " ".join(desc.split())
-        flag = ""
-        if (fm or {}).get("name") != d.name:
-            flag = "  [!]"
-        out(
-            "%-32s %8d %6.1fK  %s%s"
-            % (d.name, len(files), size / 1024.0, desc[:68] + ("..." if len(desc) > 68 else ""), flag)
-        )
-    if broken:
-        out("\nwithout SKILL.md: " + ", ".join(broken))
+    shown = 0
+    for label, root in rs:
+        if not root.is_dir():
+            continue
+        out("%s  (%s)" % (label, root))
+        entries = [
+            d for d in sorted(root.iterdir()) if d.is_dir() and not d.name.startswith(".")
+        ]
+        if not entries:
+            out("  (empty)")
+            out("")
+            continue
+        for d in entries:
+            if not (d / "SKILL.md").is_file():
+                out("  %-32s  [!] no SKILL.md" % d.name)
+                shown += 1
+                continue
+            fm, _ = read_frontmatter(d / "SKILL.md")
+            files = [p for p in d.rglob("*") if p.is_file()]
+            desc = " ".join((fm or {}).get("description", "").split())
+            flag = "" if (fm or {}).get("name") == d.name else "  [!] name mismatch"
+            out(
+                "  %-32s %2d file %6.1fK  %s%s"
+                % (
+                    d.name,
+                    len(files),
+                    sum(p.stat().st_size for p in files) / 1024.0,
+                    desc[:60] + ("..." if len(desc) > 60 else ""),
+                    flag,
+                )
+            )
+            shown += 1
+        out("")
+    if shown == 0:
+        out("nothing found in the directories above")
 
 
 def cmd_validate(args: argparse.Namespace) -> None:
-    skills = [resolve(args.name)] if args.name else skill_dirs()
-    if not skills:
-        die("no skills to validate")
+    rs = roots(args)
+    targets = [resolve(args.name, rs)] if args.name else valid_skills(rs)
+    if not targets:
+        die("no skills to validate in: %s" % ", ".join(str(r) for _, r in rs))
     worst = 0
-    for d in skills:
-        out(d.name)
+    for label, d in targets:
+        out("%s  [%s]" % (d.name, label))
         for status, msg in check(d):
             out("  %s %s" % (status, msg))
             if status == FAIL:
@@ -220,19 +311,23 @@ def _fetch_github(owner: str, repo: str, branch: str, sub: str, dest: Path) -> s
     tmp = Path(tempfile.mkdtemp(prefix="skillcli-"))
     try:
         archive = tmp / "src.tar.gz"
-        with urllib.request.urlopen(req, timeout=90) as r, archive.open("wb") as f:
+        with urllib.request.urlopen(req, timeout=120) as r, archive.open("wb") as f:
             shutil.copyfileobj(r, f)
         with tarfile.open(archive, "r:gz") as tf:
             members = tf.getmembers()
-            root = members[0].name.split("/")[0] if members else None
+            if not members:
+                die("empty archive from %s/%s@%s" % (owner, repo, branch))
+            root = members[0].name.split("/")[0]
             wanted = root if not sub else "%s/%s" % (root, sub.strip("/"))
-            picked = [m for m in members if m.name == wanted or m.name.startswith(wanted + "/")]
+            picked = [
+                m for m in members if m.name == wanted or m.name.startswith(wanted + "/")
+            ]
             if not picked:
                 die("path %r not found in %s/%s@%s" % (sub, owner, repo, branch))
             tf.extractall(tmp / "out", members=picked, filter="data")
         src = tmp / "out" / wanted
         if not (src / "SKILL.md").is_file():
-            die("SKILL.md not found at %r in %s/%s@%s" % (sub or ".", owner, repo, branch))
+            die("no SKILL.md at %r in %s/%s@%s" % (sub or ".", owner, repo, branch))
         shutil.copytree(src, dest)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -241,27 +336,28 @@ def _fetch_github(owner: str, repo: str, branch: str, sub: str, dest: Path) -> s
 
 def cmd_install(args: argparse.Namespace) -> None:
     source = args.source
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    meta: dict = {"installed_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    label, root = roots(args, for_install=True)[0]
+    root.mkdir(parents=True, exist_ok=True)
+    meta: dict = {"installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "agent": label}
 
     m = GITHUB_URL.match(source)
-    if m and not Path(source).exists():
-        owner = m.group("owner")
-        repo = m.group("repo")
+    local = Path(source).expanduser()
+
+    if m and not local.is_dir():
         branch = m.group("branch") or "main"
         sub = m.group("sub") or ""
-        name = args.name or Path(sub).name or repo
+        name = args.name or Path(sub).name or m.group("repo")
         meta.update({"source_type": "github", "source": source, "branch": branch, "sub": sub})
-    elif Path(source).expanduser().is_dir():
-        src = Path(source).expanduser().resolve()
+    elif local.is_dir():
+        src = local.resolve()
         if not (src / "SKILL.md").is_file():
             die("no SKILL.md in %s" % src)
         name = args.name or src.name
         meta.update({"source_type": "local", "source": str(src)})
     else:
-        die("source must be a local directory or a github URL: %s" % source)
+        die("source must be a local directory or a github URL, got: %s" % source)
 
-    dest = SKILLS_DIR / name
+    dest = root / name
     if dest.exists() and not args.force:
         die("%s already exists, pass --force to overwrite" % dest)
     if args.dry_run:
@@ -269,14 +365,15 @@ def cmd_install(args: argparse.Namespace) -> None:
         return
 
     if dest.exists():
-        backup = TRASH_DIR / ("%s-%s" % (name, time.strftime("%Y%m%d%H%M%S")))
+        backup = root / ".trash" / ("%s-%s" % (name, time.strftime("%Y%m%d%H%M%S")))
         backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(dest), str(backup))
         out("previous copy moved to %s" % backup)
 
     if meta["source_type"] == "github":
-        sha = _fetch_github(m.group("owner"), m.group("repo"), meta["branch"], meta["sub"], dest)
-        meta["commit"] = sha
+        meta["commit"] = _fetch_github(
+            m.group("owner"), m.group("repo"), meta["branch"], meta["sub"], dest
+        )
     else:
         shutil.copytree(Path(meta["source"]), dest)
 
@@ -284,36 +381,38 @@ def cmd_install(args: argparse.Namespace) -> None:
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     out("installed %s -> %s" % (name, dest))
-    for status, msg in check(dest):
-        if status == FAIL:
-            out("  %s %s" % (status, msg))
-
-    if not args.json_only and name == "docx-preferences":
-        out("note: docx-preferences is meant to be edited by its user")
+    problems = [msg for s, msg in check(dest) if s == FAIL]
+    if problems:
+        out("validation reported: " + "; ".join(problems))
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
-    target = resolve(args.name)
+    _, target = resolve(args.name, roots(args))
+    trash = target.parent / ".trash"
     if args.dry_run:
-        out("would move %s to %s" % (target, TRASH_DIR))
+        out("would move %s to %s" % (target, trash))
         return
-    TRASH_DIR.mkdir(parents=True, exist_ok=True)
-    backup = TRASH_DIR / ("%s-%s" % (target.name, time.strftime("%Y%m%d%H%M%S")))
+    trash.mkdir(parents=True, exist_ok=True)
+    backup = trash / ("%s-%s" % (target.name, time.strftime("%Y%m%d%H%M%S")))
     shutil.move(str(target), str(backup))
     out("moved %s to %s" % (target.name, backup))
-    out("restore with: move it back, or re-run install")
+    out("to restore, move it back out of .trash")
 
 
 def cmd_info(args: argparse.Namespace) -> None:
-    target = resolve(args.name)
-    fm, body = read_frontmatter(target / "SKILL.md")
+    label, target = resolve(args.name, roots(args))
+    fm, _ = read_frontmatter(target / "SKILL.md")
     out("directory : %s" % target)
+    out("target    : %s" % label)
     out("name      : %s" % (fm or {}).get("name"))
-    out("created   : %s" % (fm or {}).get("agent_created"))
+    out("created   : agent_created=%s" % (fm or {}).get("agent_created"))
     files = [p for p in target.rglob("*") if p.is_file()]
-    out("files     : %d (%.1f KB)" % (len(files), sum(p.stat().st_size for p in files) / 1024.0))
+    out(
+        "files     : %d (%.1f KB)"
+        % (len(files), sum(p.stat().st_size for p in files) / 1024.0)
+    )
     for p in sorted(files):
-        out("   %s" % p.relative_to(target))
+        out("   %s" % p.relative_to(target).as_posix())
     meta = target / ".metadata.json"
     if meta.is_file():
         data = json.loads(meta.read_text(encoding="utf-8"))
@@ -326,14 +425,14 @@ def cmd_info(args: argparse.Namespace) -> None:
 
 
 def cmd_pack(args: argparse.Namespace) -> None:
-    target = resolve(args.name)
+    _, target = resolve(args.name, roots(args))
     outdir = Path(args.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     zip_path = outdir / ("%s-%s.zip" % (target.name, args.version or time.strftime("%Y%m%d")))
 
     failures = [m for s, m in check(target) if s == FAIL]
     if failures and not args.force:
-        die("validation failed, fix these first: " + "; ".join(failures))
+        die("validation failed, fix first (or pass --force): " + "; ".join(failures))
 
     wrote = []
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -353,12 +452,14 @@ def cmd_pack(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="skillcli",
-        description="Manage WorkBuddy skills in %s" % SKILLS_DIR,
+        description="Manage agent skills. Known agents: " + ", ".join(sorted(AGENTS)),
     )
-    p.add_argument("--skills-dir", help="override the skills directory")
+    p.add_argument("--agent", "-a", help="target agent: " + ", ".join(sorted(AGENTS)))
+    p.add_argument("--scope", choices=["global", "project"], help="default: global")
+    p.add_argument("--skills-dir", help="explicit skills directory, overrides --agent")
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("list", help="list installed skills")
+    s = sub.add_parser("list", help="list skills across the resolved targets")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_list)
 
@@ -366,15 +467,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("name", nargs="?")
     s.set_defaults(func=cmd_validate)
 
-    s = sub.add_parser("install", help="install from a local dir or github URL")
+    s = sub.add_parser("install", help="install from a local directory or github URL")
     s.add_argument("source")
-    s.add_argument("--name")
+    s.add_argument("--name", help="override the installed directory name")
     s.add_argument("--force", action="store_true")
     s.add_argument("--dry-run", action="store_true")
-    s.add_argument("--json-only", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_install)
 
-    s = sub.add_parser("uninstall", help="move a skill to .trash")
+    s = sub.add_parser("uninstall", help="move a skill into .trash")
     s.add_argument("name")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_uninstall)
@@ -394,11 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    global SKILLS_DIR, TRASH_DIR
     args = build_parser().parse_args()
-    if getattr(args, "skills_dir", None):
-        SKILLS_DIR = Path(args.skills_dir).expanduser().resolve()
-        TRASH_DIR = SKILLS_DIR / ".trash"
     args.func(args)
 
 
