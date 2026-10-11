@@ -358,11 +358,12 @@ def cmd_install(args: argparse.Namespace) -> None:
         die("source must be a local directory or a github URL, got: %s" % source)
 
     dest = root / name
+    if args.dry_run:
+        action = "overwrite" if dest.exists() else "create"
+        out("would %s %s -> %s" % (action, source, dest))
+        return
     if dest.exists() and not args.force:
         die("%s already exists, pass --force to overwrite" % dest)
-    if args.dry_run:
-        out("would install %s -> %s" % (source, dest))
-        return
 
     if dest.exists():
         backup = root / ".trash" / ("%s-%s" % (name, time.strftime("%Y%m%d%H%M%S")))
@@ -454,36 +455,51 @@ def build_parser() -> argparse.ArgumentParser:
         prog="skillcli",
         description="Manage agent skills. Known agents: " + ", ".join(sorted(AGENTS)),
     )
-    p.add_argument("--agent", "-a", help="target agent: " + ", ".join(sorted(AGENTS)))
+    agent_help = "target agent: " + ", ".join(sorted(AGENTS))
+    p.add_argument("--agent", "-a", help=agent_help)
     p.add_argument("--scope", choices=["global", "project"], help="default: global")
     p.add_argument("--skills-dir", help="explicit skills directory, overrides --agent")
+
+    # The same three options are accepted after the subcommand as well. SUPPRESS
+    # keeps an absent one from overwriting whatever the main parser already set.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--agent", "-a", default=argparse.SUPPRESS, help=agent_help)
+    common.add_argument(
+        "--scope", choices=["global", "project"], default=argparse.SUPPRESS, help="default: global"
+    )
+    common.add_argument(
+        "--skills-dir", default=argparse.SUPPRESS, help="explicit skills directory, overrides --agent"
+    )
+
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("list", help="list skills across the resolved targets")
+    s = sub.add_parser("list", parents=[common], help="list skills across the resolved targets")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_list)
 
-    s = sub.add_parser("validate", help="check frontmatter and layout")
+    s = sub.add_parser("validate", parents=[common], help="check frontmatter and layout")
     s.add_argument("name", nargs="?")
     s.set_defaults(func=cmd_validate)
 
-    s = sub.add_parser("install", help="install from a local directory or github URL")
+    s = sub.add_parser(
+        "install", parents=[common], help="install from a local directory or github URL"
+    )
     s.add_argument("source")
     s.add_argument("--name", help="override the installed directory name")
     s.add_argument("--force", action="store_true")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_install)
 
-    s = sub.add_parser("uninstall", help="move a skill into .trash")
+    s = sub.add_parser("uninstall", parents=[common], help="move a skill into .trash")
     s.add_argument("name")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_uninstall)
 
-    s = sub.add_parser("info", help="show one skill in detail")
+    s = sub.add_parser("info", parents=[common], help="show one skill in detail")
     s.add_argument("name")
     s.set_defaults(func=cmd_info)
 
-    s = sub.add_parser("pack", help="zip a skill for distribution")
+    s = sub.add_parser("pack", parents=[common], help="zip a skill for distribution")
     s.add_argument("name")
     s.add_argument("-o", "--outdir", default="dist")
     s.add_argument("--version")
