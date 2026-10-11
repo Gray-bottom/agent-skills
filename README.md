@@ -1,21 +1,19 @@
 # agent-skills
 
-A few agent skills, plus a CLI that manages them across agents.
+一批 agent 技能，外加一个跨 agent 管理它们的命令行工具。
 
-Nothing here is tied to one product. Every skill is a directory with a `SKILL.md`
-in it, and every agent that discovers skills from a `<agent-home>/skills/`
-folder can use the same files.
+这里的东西不绑定任何特定产品。每个技能就是一个含 `SKILL.md` 的目录，任何从 `<agent 目录>/skills/` 发现技能的 agent 都能直接用同一批文件。
 
-## Contents
+## 目录内容
 
-| Path | What it is |
+| 路径 | 说明 |
 | --- | --- |
-| `skills/md-to-deliverable-docx/` | Turn Markdown written in a chat into a deliverable Word file with pandoc. Generic, no personal preferences baked in |
-| `tools/skillcli.py` | CLI for `list`, `validate`, `install`, `uninstall`, `info` and `pack` |
+| `skills/md-to-deliverable-docx/` | 把对话里写好的 Markdown 用 pandoc 转成可交付的 Word 文档。通用层，不掺个人偏好 |
+| `tools/skillcli.py` | 命令行工具，提供 `list`、`validate`、`install`、`uninstall`、`info`、`pack` |
 
-## Where skills live
+## 技能目录位置
 
-| Agent | Global | Project |
+| Agent | 全局 | 项目级 |
 | --- | --- | --- |
 | WorkBuddy | `~/.workbuddy/skills` | `.workbuddy/skills` |
 | Claude Code | `~/.claude/skills` | `.claude/skills` |
@@ -23,16 +21,16 @@ folder can use the same files.
 | OpenClaw | `~/.openclaw/skills` | `.agents/skills` |
 | Gemini CLI | `~/.gemini/skills` | `.agents/skills` |
 
-## Install a skill
+## 安装技能
 
-Copy it into whichever directory above matches your agent:
+拷进上表里对应 agent 的目录即可：
 
 ```bash
 git clone https://github.com/Gray-bottom/agent-skills.git
 cp -r agent-skills/skills/md-to-deliverable-docx ~/.claude/skills/
 ```
 
-Or with the official CLI, which installs from a GitHub URL:
+也可以用官方 CLI，它支持从 GitHub 地址安装：
 
 ```bash
 npx @tomaskral/skillmanager@latest install \
@@ -40,14 +38,14 @@ npx @tomaskral/skillmanager@latest install \
   --agent claude
 ```
 
-## skillcli
+## 使用 skillcli
 
-Python 3.9 or newer, standard library only, no dependencies.
+需要 Python 3.9 以上，只用标准库，无依赖。
 
 ```bash
-python tools/skillcli.py list                    # every known agent whose skills dir exists
+python tools/skillcli.py list                    # 列出所有已存在技能目录的 agent
 python tools/skillcli.py list --json
-python tools/skillcli.py validate                # all skills in scope
+python tools/skillcli.py validate                # 校验当前范围内的全部技能
 python tools/skillcli.py validate md-to-deliverable-docx
 python tools/skillcli.py info md-to-deliverable-docx
 python tools/skillcli.py install ./some-skill --agent claude --dry-run
@@ -56,50 +54,35 @@ python tools/skillcli.py uninstall some-skill --agent codex
 python tools/skillcli.py pack md-to-deliverable-docx -o dist
 ```
 
-`install` requires an explicit target, either `--agent` or `--skills-dir`. Everything
-else falls back to every agent directory that already exists, and refuses to act when
-a skill name appears in more than one of them.
+`--agent` 和 `--skills-dir` 放在子命令前后都可以。
 
-Set `GITHUB_TOKEN` to install from private repositories.
+目标目录的解析顺序：`--skills-dir`、`--agent` 加 `--scope`、环境变量 `SKILLS_DIR` 或 `SKILLS_AGENT`、所有已存在的 agent 目录，最后是报错提示。`install` 必须给出明确目标。除 `install` 之外的命令，如果一个技能名在多个目录里同时存在，工具会拒绝执行并列出候选，避免改错地方。
 
-`uninstall` moves the skill to `<skills-dir>/.trash/<name>-<timestamp>` instead of
-deleting it, so an accidental removal is recoverable.
+从私有仓库安装时设置 `GITHUB_TOKEN` 环境变量。
 
-`pack` refuses to build a zip when validation fails; pass `--force` to override.
+`uninstall` 把技能移进 `<技能目录>/.trash/<名称>-<时间戳>`，不直接删除，误删可以捞回来。
 
-### Why not only use skillmanager
+`pack` 在校验不通过时拒绝打包，除非显式加 `--force`。
 
-The official [`@tomaskral/skillmanager`](https://github.com/kadel/skillmanager) is
-good at install and update, but its `--agent` list stops at `claude`, `openclaw`,
-`codex` and `gemini`, and it has no validation or packaging. `skillcli` covers the
-same agents plus WorkBuddy, and adds `validate`, `info` and `pack`. They can sit side
-by side without interfering.
+### 为什么不只用官方 skillmanager
 
-## What md-to-deliverable-docx is for
+官方 [`@tomaskral/skillmanager`](https://github.com/kadel/skillmanager) 擅长安装与更新，但它的 `--agent` 只到 `claude`、`openclaw`、`codex`、`gemini` 四个，也没有校验与打包。`skillcli` 覆盖同一批 agent 并加上 WorkBuddy，另外补了 `validate`、`info`、`pack`。两者可以并存，互不干扰。
 
-Converting Markdown into a `.docx` with pandoc, and getting the awkward cases right.
-Three rules carry most of the value:
+## md-to-deliverable-docx 解决什么
 
-1. The reference template comes from the user. Ask for its path before converting.
-   If it is not given, stop rather than falling back to default styles.
-2. Convert directly, `pandoc in.md -o out.docx --reference-doc <template>`.
-   Routing through HTML (`md -> html -> docx`) silently destroys LaTeX math: inline
-   formulas collapse to plain text and display formulas stay in the document as raw
-   TeX. Any document containing math must avoid that route.
-3. Direct conversion drops raw HTML `<sub>`, `<sup>` and `<u>`. Use the native
-   `~x~` and `^x^` syntax instead.
+把 Markdown 转成 `.docx`，重点是把几个容易翻车的地方处理对。三条规则撑起大部分价值：
 
-Full rules, including the CJK path workaround and the known failure modes, are in
-`skills/md-to-deliverable-docx/SKILL.md`.
+1. 参考模板由使用者提供。转换前先问路径，没给就停下来，不要退回默认样式硬出。
+2. 默认走直连，`pandoc in.md -o out.docx --reference-doc <模板>`。绕道 HTML 的两段式管线（`md -> html -> docx`）会静默毁掉 LaTeX 公式：行内公式塌成纯文本，行间公式以原始 TeX 留在正文里。含公式的文档一律不能走那条路。
+3. 直连会丢掉原始 HTML 的 `<sub>`、`<sup>`、`<u>`，改用原生 `~x~` 与 `^x^` 语法。
 
-## Not included
+完整规则在 `skills/md-to-deliverable-docx/SKILL.md`，含中文路径的绕行办法和已知失败模式。
 
-- Reference templates are not bundled. Bring your own `.docx`.
-- The `markdown-to-docx.lua` filter from
-  [Achuan-2/pandoc_docx_template](https://github.com/Achuan-2/pandoc_docx_template)
-  is not bundled either. Without it, `==highlight==`, HTML colour spans and HTML
-  `<img>` tags are ignored, so use native Markdown syntax for those.
+## 不含的内容
 
-## License
+- 不附带参考模板。用你自备的 `.docx`。
+- 不附带 [Achuan-2/pandoc_docx_template](https://github.com/Achuan-2/pandoc_docx_template) 里的 `markdown-to-docx.lua` 过滤器。没有它时，`==高亮==`、HTML 颜色 span 和 HTML `<img>` 会被忽略，这几处改用原生 Markdown 语法。
 
-MIT, see [LICENSE](LICENSE).
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。
